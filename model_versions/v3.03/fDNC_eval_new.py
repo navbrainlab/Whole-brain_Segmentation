@@ -378,8 +378,9 @@ if __name__ == "__main__":
                     test_names = [i.split('/')[-1] for i in data_batch['pt_names']]
                     test_embedds = output_pairs['save_embedd'][pm_idx]['test'].detach().cpu()
                     test_name2embedd = {n:e for n,e in zip(test_names, test_embedds)}
-                    test_name2embedd[temp_vol_name] = output_pairs['save_embedd'][pm_idx]['temp']
-                    all_batch_name2embedd[pm_idx] = {**all_batch_name2embedd[pm_idx],**test_name2embedd}
+                    test_name2embedd[temp_vol_name] = output_pairs['save_embedd'][pm_idx]['temp'].detach().cpu()
+                    all_batch_name2embedd[pm_idx] = {**all_batch_name2embedd[pm_idx],**test_name2embedd,**{'logits':output_pairs['logits_scale'].detach().cpu()}}
+
                 except:
                     pass
                 #----------------------------------------------------------------------------------------------------------------------

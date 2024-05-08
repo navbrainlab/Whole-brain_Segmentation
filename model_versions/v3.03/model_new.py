@@ -440,31 +440,22 @@ class NIT_Registration(nn.Module):
 
         self.device = torch.device("cuda:0" if cuda else "cpu")
         #----------------------add-------------------------------
-        # self.xy_ptf = nn.Sequential(
-        #     nn.Conv1d(2, n_hidden, 1),
-        #     nn.BatchNorm1d(n_hidden)
-        # )
-        # self.xz_ptf = nn.Sequential(
-        #     nn.Conv1d(2, n_hidden, 1),
-        #     nn.BatchNorm1d(n_hidden)
-        # )
-        # self.yz_ptf = nn.Sequential(
-        #     nn.Conv1d(2, n_hidden, 1),
-        #     nn.BatchNorm1d(n_hidden)
-        # )
         self.xyz_ptf = nn.Sequential(
             nn.Conv1d(3, n_hidden, 1),
             nn.BatchNorm1d(n_hidden)
         )
 
-        # self.xy_xz_yz_xyz_weight = nn.Parameter(torch.tensor([2.,2.,2.,4.]))
+        
         self.n_hidden = n_hidden
         self.n_layer = n_layer
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-        
-        # self.enc_layer_pos = nn.Embedding(self.encoder_layer_num,n_hidden)
-        # self.fc_xyz = nn.Linear(n_hidden,3)
-        # self.ref_embedding = nn.Embedding(1,n_hidden)
+        self.cls = nn.Embedding(1,n_hidden)
+        self.decode_xyz = nn.Sequential(
+            nn.Linear(128,256),
+            nn.ReLU(),
+            nn.Linear(256,3)
+        )
+
         self._reset_parameters()
 
     def to_input_tensor(self, pts, pad_pt=[0, 0, 0]):
@@ -501,47 +492,25 @@ class NIT_Registration(nn.Module):
     def encode(self, pts_padded, pts_length, ref_idx):
         xyz_pts_proj = self.xyz_ptf(pts_padded.transpose(2, 1))
         xyz_pts_proj = xyz_pts_proj.transpose(2,1)
-
-        # xy_pts_proj = self.xy_ptf(pts_padded[:,:,[0,1]].transpose(2, 1))
-        # xy_pts_proj = xy_pts_proj.transpose(2,1)
-
-        # xz_pts_proj = self.xz_ptf(pts_padded[:,:,[0,2]].transpose(2, 1))
-        # xz_pts_proj = xz_pts_proj.transpose(2,1)
-
-        # yz_pts_proj = self.yz_ptf(pts_padded[:,:,[1,2]].transpose(2, 1))
-        # yz_pts_proj = yz_pts_proj.transpose(2,1)
-
         mask = self.generate_sent_masks(xyz_pts_proj, pts_length)
-
-        xyz_return = self.for_encode(xyz_pts_proj, pts_length, mask, ref_idx)
-        # xy_return = self.for_encode(xy_pts_proj, pts_length, mask, ref_idx)
-        # xz_return = self.for_encode(xz_pts_proj, pts_length, mask, ref_idx)
-        # yz_return = self.for_encode(yz_pts_proj, pts_length, mask, ref_idx)
-
+        decoded_to_return, temp_cls_token = self.for_encode(xyz_pts_proj, pts_length, mask, ref_idx)
         to_return = ([],[])
-        to_return[0].extend(xyz_return[0][:6])
-        # to_return[0].extend(xy_return[0][4:6])
-        # to_return[0].extend(xz_return[0][4:6])
-        # to_return[0].extend(yz_return[0][4:6])
-        # ensemble = torch.stack(
-        #     [xy_return[0][5],
-        #      xz_return[0][5],
-        #      yz_return[0][5],
-        #      xyz_return[0][5],
-        #     ],
-        #     dim=0
-        # )
-        # ensemble = torch.mean(self.xy_xz_yz_xyz_weight[:,None,None,None]*ensemble[:],dim=0)
-        # to_return[0].append(ensemble)
-        
-        # xyz_return[0].extend(xy_return[0][-2:])
-        # xyz_return[0].extend(xz_return[0][-2:])
-        # xyz_return[0].extend(yz_return[0][-2:])
+        to_return[0].extend(decoded_to_return[:6])
+        to_return[1].append(temp_cls_token)
         return to_return
-        return xyz_return
+
 
     def for_encode(self, pts_proj, pts_length, mask, ref_idx):
-        pts_encode = self.encoder_model(pts_proj.transpose(dim0=0, dim1=1),src_key_padding_mask=mask)
+        cls_mask = torch.zeros(64,1,device=self.device).bool()
+
+        cls_token = torch.repeat_interleave(self.cls.weight,64,0)
+
+        cat_cls_mask = torch.concatenate([cls_mask, mask],dim=1)
+        cat_cls_token = torch.concat([cls_token[:,None,:], pts_proj],dim=1)
+
+        pts_encode = self.encoder_model(cat_cls_token.transpose(dim0=0, dim1=1),src_key_padding_mask=cat_cls_mask)
+        temp_cls_token = [i[0,:,:] for i in pts_encode][-1][ref_idx]
+        pts_encode = [i[1:,:,:] for i in pts_encode]
 
         ref_pts_proj = pts_encode[-1][:pts_length[ref_idx], ref_idx:ref_idx+1, :]
         encode_layers_ref_pts_proj = [p[:pts_length[ref_idx], ref_idx:ref_idx+1, :] for p in pts_encode]
@@ -557,8 +526,7 @@ class NIT_Registration(nn.Module):
                                          memory=ref_pts_proj, memory_key_padding_mask=mem_mask)
 
         decoded_to_return = [torch.concatenate([ref_pts_proj,pts_d],dim=0).transpose(1,0) for pts_d in pts_decoded]
-        encoded_pair_contrastive = [torch.concatenate([encode_layers_ref_pts_proj[i],pts_encode[i]],dim=0).transpose(1,0) for i in range(len(pts_encode))]
-        return (decoded_to_return, encoded_pair_contrastive)
+        return (decoded_to_return, temp_cls_token)
 
     def generate_mem_mask(self, num_rows, num_cols, r, device):
         vector = torch.zeros(num_rows, num_cols,device=device)
@@ -589,7 +557,7 @@ class NIT_Registration(nn.Module):
         # mov_emb, ref_emb = self.encode(pts_padded, pts_lengths, ref_idx)
 
 
-        pts_encode, encoded_pair_contrastive = self.encode(pts_padded, pts_lengths, ref_idx)
+        pts_encode, temp_cls_token = self.encode(pts_padded, pts_lengths, ref_idx)
         # encoded_pair_contrastive.extend(pts_encode)
         # pts_encode = encoded_pair_contrastive
         # if self.training:
@@ -620,6 +588,7 @@ class NIT_Registration(nn.Module):
         loss = 0
         num_pt = 0
         loss_entropy = 0
+        mse_loss = 0
         num_unlabel = 0
         output_pairs = dict()
         loss_dict = dict()
@@ -632,17 +601,27 @@ class NIT_Registration(nn.Module):
                 if len(match) > 0:
                     match_mov = match[:, 0]
                     match_ref = match[:, 1]
-                    alx_i_w_multi_layer_logits = torch.stack([p[i_w ,match_mov, :] for p in layers_sim_m])
-                    alx_i_w_label = torch.tensor(match_ref, device=pts_padded.device)
-                    alx_cross_entropy_loss = torch.stack([nn.CrossEntropyLoss()(p, alx_i_w_label) for p in alx_i_w_multi_layer_logits]).mean()
-                    
-                    # -----------------------------along y axis
-                    aly_i_w_multi_layer_logits = torch.stack([p[i_w ,:,match_ref] for p in layers_sim_m]).permute(0,2,1)
-                    aly_i_w_label = torch.tensor(match_mov, device=pts_padded.device)
-                    aly_cross_entropy_loss = torch.stack([nn.CrossEntropyLoss()(p, aly_i_w_label) for p in aly_i_w_multi_layer_logits]).mean()
+                    # along x axis,
+                    log_p = torch.stack([p[i_w, match_mov, match_ref] for p in p_m_exp])## 每个test neuron与真实对应temp neuron的匹配概率
+                    log_p_neg = torch.stack([p[i_w, match_mov, :] for p in p_m_exp])
+                    loss += (log_p_neg.sum() - 2*log_p.sum())/torch.prod(torch.tensor(log_p.shape))
 
-                    loss += (aly_cross_entropy_loss + alx_cross_entropy_loss)/2
-                    
+                    # -----------------------------along y axis
+                    log_p = torch.stack([p[i_w, match_mov, match_ref] for p in p_m_exp_alongy])## 每个test neuron与真实对应temp neuron的匹配概率      
+                    log_p_neg = torch.stack([p[i_w, :, match_ref] for p in p_m_exp_alongy])
+                    loss += (log_p_neg.sum() - 2*log_p.sum())/torch.prod(torch.tensor(log_p.shape))
+
+                    # mse loss 
+                    mse = F.mse_loss(mov_emb_list[-1][i_w,match_mov,:], ref_emb_list[-1][i_w, match_ref,:],reduction='mean')
+                    loss += mse
+
+                    # fintune decode xyz loss
+                    layers_emb = torch.stack([i[i_w,match_mov] for i in mov_emb_list],dim=0) + temp_cls_token[0][None,None,:]
+                    p_xyz = self.decode_xyz(layers_emb)
+                    xyz_label = pts_padded[i_w, match_ref,:].repeat(6,1,1)
+                    xyz_loss = F.mse_loss(p_xyz, xyz_label)
+                    loss += xyz_loss
+
                     num_pt += len(match_mov)
                 # loss for outliers.
                 outlier_list = self.match_dict['outlier_{}'.format(i_w)]
@@ -674,7 +653,8 @@ class NIT_Registration(nn.Module):
             # layers_sim_m.append(weighted_ensemble)
             output_pairs['p_m'] = layers_sim_m
             save_temp_test_embed = [{'temp':ref_emb[0] ,'test':mov_emb} for mov_emb,ref_emb in zip(mov_emb_list, ref_emb_list)]
-            output_pairs['save_embedd'] = save_temp_test_embed               
+            output_pairs['save_embedd'] = save_temp_test_embed
+            output_pairs['logits_scale'] = logit_scale               
             # choose the matched pairs for worm1
             paired_idx = torch.argmax(p_m_exp[-1], dim=1)
             output_pairs['paired_idx'] = paired_idx
